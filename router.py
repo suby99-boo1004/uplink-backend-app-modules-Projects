@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from app.modules.estimates.service import delete_estimate_with_revisions
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, get_current_user
@@ -1593,19 +1594,32 @@ def reopen_project(
 
 
 
-@router.delete("/{project_id}", response_model=Dict[str, Any])
+@router.delete("/{project_id}")
 def delete_project(
     project_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
-    _require_admin(current_user)
+):
+    # 관리자만 허용 (대표님 기준 role_id == 6)
+    if current_user.role_id != 6:
+        raise HTTPException(status_code=403, detail="관리자만 삭제할 수 있습니다.")
 
-    try:
-        db.execute(text("DELETE FROM project_updates WHERE project_id = :id"), {"id": project_id})
-    except Exception:
-        pass
+    # 1) 해당 프로젝트에 연결된 견적서 조회
+    rows = db.execute(
+        text("SELECT id FROM estimates WHERE project_id = :pid"),
+        {"pid": project_id},
+    ).fetchall()
 
-    db.execute(text("DELETE FROM projects WHERE id = :id"), {"id": project_id})
+    # 2) 견적서가 있으면 구견적 포함 전부 삭제
+    for r in rows:
+        estimate_id = int(r[0])
+        delete_estimate_with_revisions(db, estimate_id)
+
+    # 3) 프로젝트 삭제
+    db.execute(
+        text("DELETE FROM projects WHERE id = :pid"),
+        {"pid": project_id},
+    )
+
     db.commit()
-    return {"ok": True}
+    return {"result": "ok"}
