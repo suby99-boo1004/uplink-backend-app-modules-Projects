@@ -1668,15 +1668,62 @@ def _save_project_completion_scores_snapshot(
         except Exception:
             update_count_by_user = {}
 
-    # total score: converted_score 합계(기존 로직 유지)
+    # ✅ 프로젝트 총점(배점) 계산: projects 테이블의 관리자 점수 항목 합계
+    # (대표님 DB에는 배점 전용 컬럼이 없으므로, 아래 항목 합계를 '프로젝트 총점'으로 사용)
+    project_total = 0.0
+    try:
+        r = db.execute(
+            text(
+                """
+                SELECT
+                  COALESCE(project_period_days,0) AS project_period_days,
+                  COALESCE(difficulty,0) AS difficulty,
+                  COALESCE(progress_step,0) AS progress_step,
+                  COALESCE(participant_count,0) AS participant_count,
+                  COALESCE(profit_rate,0) AS profit_rate,
+                  COALESCE(sales_score,0) AS sales_score,
+                  COALESCE(work_speed,0) AS work_speed,
+                  COALESCE(internal_score,0) AS internal_score,
+                  COALESCE(external_score,0) AS external_score
+                FROM projects
+                WHERE id = :id
+                """
+            ),
+            {"id": project_id},
+        ).mappings().first()
+        if r:
+            pr = float(r.get("profit_rate") or 0.0)
+            pr = math.floor(pr * 10) / 10.0  # 소수 1자리 절사(버림) 고정
+            project_total = (
+                float(r.get("project_period_days") or 0.0)
+                + float(r.get("difficulty") or 0.0)
+                + float(r.get("progress_step") or 0.0)
+                + float(r.get("participant_count") or 0.0)
+                + pr
+                + float(r.get("sales_score") or 0.0)
+                + float(r.get("work_speed") or 0.0)
+                + float(r.get("internal_score") or 0.0)
+                + float(r.get("external_score") or 0.0)
+            )
+    except Exception:
+        # 총점 계산 실패 시에도 완료 처리에 영향 주지 않음
+        project_total = 0.0
+
+    # 참여자 점수/환산점수 준비
     safe_parts = []
-    total = 0.0
+    total_allocated = 0.0
     for p in participants or []:
         uid = int(p.get("user_id") or p.get("employee_id") or 0)
         score = float(p.get("score") if p.get("score") is not None else p.get("user_eval_score") or 0.0)
-        conv = float(p.get("converted_score") if p.get("converted_score") is not None else score)
         if uid <= 0:
             continue
+
+        # 환산점수: (개인점수 0~10 기준) * 프로젝트총점
+        if project_total > 0:
+            conv = (score / 10.0) * float(project_total)
+        else:
+            conv = float(p.get("converted_score") if p.get("converted_score") is not None else score)
+
         safe_parts.append(
             {
                 "user_id": uid,
@@ -1685,9 +1732,12 @@ def _save_project_completion_scores_snapshot(
                 "update_count": int(update_count_by_user.get(uid, 0)),
             }
         )
-        total += conv
+        total_allocated += float(conv)
 
-    # 1) 기존 active 스냅샷 비활성화
+    # ✅ 스냅샷 final_project_score는 '프로젝트 총점(배점)'을 저장
+    # (project_total이 0이면 기존 로직 호환을 위해 환산점수 합계를 저장)
+    final_project_score = float(project_total) if project_total > 0 else float(total_allocated)
+# 1) 기존 active 스냅샷 비활성화
     try:
         db.execute(
             text(
@@ -1714,22 +1764,22 @@ def _save_project_completion_scores_snapshot(
                 text(
                     """
                     INSERT INTO project_completion_snapshots (project_id, final_project_score, completed_by, completed_at, is_active)
-                    VALUES (:pid, :total, :by, NOW(), true)
+                    VALUES (:pid, :final_score, :by, NOW(), true)
                     RETURNING id
                     """
                 ),
-                {"pid": project_id, "total": float(total), "by": int(completed_by)},
+                {"pid": project_id, "final_score": float(final_project_score), "by": int(completed_by)},
             ).scalar()
         else:
             r = db.execute(
                 text(
                     """
                     INSERT INTO project_completion_snapshots (project_id, final_project_score, completed_at, is_active)
-                    VALUES (:pid, :total, NOW(), true)
+                    VALUES (:pid, :final_score, NOW(), true)
                     RETURNING id
                     """
                 ),
-                {"pid": project_id, "total": float(total)},
+                {"pid": project_id, "final_score": float(final_project_score)},
             ).scalar()
         snapshot_id = int(r) if r is not None else None
     except Exception:
@@ -1823,6 +1873,29 @@ def complete_project(
         """),
         {"id": project_id, "new_status": new_status},
     )
+
+
+    # ✅ (필수 보정) 완료 시점에 참여자수/이익률 점수를 projects에 확정 저장
+    # - 대표님 DB에서 participant_count, profit_rate가 총점 계산에 포함되므로 완료 시점에 정확히 맞춘다.
+    try:
+        if _column_exists(db, "projects", "participant_count"):
+            db.execute(
+                text("UPDATE projects SET participant_count = :cnt, updated_at = NOW() WHERE id = :id"),
+                {"id": project_id, "cnt": int(len(payload.participants or []))},
+            )
+        if _column_exists(db, "projects", "profit_rate"):
+            pr = db.execute(text("SELECT profit_rate FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+            if pr is not None:
+                import math
+                # 1.6 -> 2 (반올림). Python round()의 bankers rounding 방지
+                pr_score = math.floor(float(pr) + 0.5)
+                db.execute(
+                    text("UPDATE projects SET profit_rate = :pr, updated_at = NOW() WHERE id = :id"),
+                    {"id": project_id, "pr": float(pr_score)},
+                )
+    except Exception:
+        # 보정 실패는 완료 처리 전체를 막지 않음(다만 이후 총점 계산에 영향 가능)
+        pass
 
     # 참여자 점수 저장
     if _table_exists(db, "project_evaluations"):
